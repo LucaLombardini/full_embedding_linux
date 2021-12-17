@@ -4,3 +4,6 @@
 [submodule "kernel"]
 	path = kernel
 	url = /home/luca/Scrivania/polito/OSes/project/kernel/stm32f401re_lnx_5.12.git
+[submodule "cramfs-tools"]
+	path = cramfs-tools
+	url = /home/luca/Scrivania/polito/OSes/project/cramfs-tools/cramfs-tools.git

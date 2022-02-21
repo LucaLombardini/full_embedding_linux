@@ -18,4 +18,7 @@
 #		ARM's M4-based STM32F401RE microcontroller. If not acceptable, 
 #		a more performant one can be considered.
 ################################################################################
-#	
+#	STATUS:
+#		Under Development, still can't fit in the Target.
+#		STM32F401xx: ROM & RAM constraints unmet.
+################################################################################

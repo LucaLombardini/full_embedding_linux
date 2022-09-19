@@ -1,0 +1,23 @@
+Ibus:
+	ISSUE:	Ibus only takes instructions from the internal Flash or the 
+		internal sram.
+	FIX:	If the kernel + applications [+ bootloader] <= 512kB, 
+		everything directly stored into the internal flash. Otherwise,
+		some parts must be loaded from an external flash into the sram
+		and target sram as Ibus source. This can cause Latency and the 
+		swapping management cost.
+		Possible configs:
+			1 - Int.Flash:	Bootloader
+					Kernel
+			    		Applications
+
+			2 - Int.Flash:	Bootloader
+					Kernel
+			    Int.Sram:	Application
+			    Ext.Flash:	Applications
+
+			3 - Int.Flash:	Bootloader
+			    Int.Sram:	Kernel
+					Application
+			    Ext.Flash:	Kernel
+					Applications

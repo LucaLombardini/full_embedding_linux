@@ -1,0 +1,36 @@
+APPLICATION BINARY INTERFACE (ABI)
+	On arm, eabi and oabi are the two major interfaces. The other two are 
+	Thumb abi and Intel iwmmx abi (usually not recommended for most uses).
+	
+	EABI: embedded abi. It supports faster fp operations and Thumb 
+		interworking, but only on armv4t and newer cores. Eabi has 
+		sub-ABIs.
+		
+		aapcs-linux: standard Linux 4 byte enums. (recommended)
+
+		aapcs: variable length enums.
+
+	OABI: old abi. Also called apcs-gnu, it supports armv4 and older cores.
+		Generally not used by modern arm processors.
+
+		apcs-gnu:
+
+	Thumb-ABI:
+		atpcs:
+
+	Intel-IWMMX:
+		iwmmxt:
+
+FLOATING-POINT ABI:
+	Tell gcc how to implement floating-point instructions.
+
+MACHINE ARCHITECTURE:
+	The stm32f401re mcu is an armv7e-m core.
+
+MACHINE TUNE:
+	The stm32f401re mcu is a cortex-m4 core.
+
+MACHINE CODE:
+	The arm cpu can execute in arm or thumb mode. The former generally 
+	produces faster code while the latter generally produces denser code.
+	Default: arm.

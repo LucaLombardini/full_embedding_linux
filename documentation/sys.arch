@@ -1,0 +1,12 @@
+cpu:
+	core=cortex-m4
+	ram=96kB
+	flash=512kB
+	freq=84MHz
+
+bus connectivity:
+	Ibus=flash|sram1
+	Dbus=flash|sram1
+	Sbus=sram1|ahb1|ahb2
+	dma1=memoryBus
+	dma2=memoryBus|peripheralBus

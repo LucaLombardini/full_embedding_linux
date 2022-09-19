@@ -1,0 +1,42 @@
+Kernel compilations:
+	1 - tinyconfig + printk + ... 	-> arm (gcc-arm-linux-gnueabihf)
+	2 - tinyconfig			-> arm (gcc-arm-linux-gnueabihf)
+	3 - tinyconfig			-> x86 (gcc)
+	4 - tinyconfig - syscall(x)	-> x86 (gcc)
+	5 - tinyconfig			-> arm (gcc + flags) (VOIDED)
+	6 - tinyconfig + printk + ...	-> arm (gcc + flags) (VOIDED)
+	7 - tinyconfig + pvh_header	-> x86 (gcc)
+
+Kernel executable comparison:
+	1 vs 2 - what have been introduced with Kconfig customization
+	2 vs 3 - architecture dependent/independent syscalls
+	4 - kernel testing
+	2 vs 5 - toolchain comparison on minimal kernel (VOIDED)
+	1 vs 6 - toolchain comparison on not minimal kernel (VOIDED)
+
+Further kernel tinyfication:
+	Kernel profiling under the x86 VM, track the unused kernel parts (likely
+	syscalls). Remove those calls from the source/object tree during 
+	compilation/linking.
+
+Note:	kernel compilation #7: menuconfig modification
+		
+		Processor type and features ---> Linux guest support 
+		--->Support for running as a PVH guest
+
+			Qemu needs the PVH header to be able to load the kernel 
+			into memory. The kernel did not crash.
+
+		Printk support
+
+		Initramfs
+
+		Executable file format ---> Kernel support for ELF
+
+			The kernel can't load from the initramfs a binary which
+			was not compiled "with" the kernel
+
+		Device Drivers ---> Character devices ---> Enable tty (true) 
+		---> Serial drivers ---> 8250/16550 and compatible serial support (true) && Console on 8250/16550 and compatible serial port (true).
+
+			Kernel need serial drivers to use a serial console

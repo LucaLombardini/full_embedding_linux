@@ -1,0 +1,60 @@
+Protection:
+	ISSUE:	The kernel must protect the system from direct application's hw
+		handling and sw behavior. 
+		Cortex-M4 have privileged and unprivileged instructions. The
+		former is reserved for the kernel instructions, the latter for
+		the applications.
+		The privilege level is set by the CONTROL register.
+		The core has two functioning modes: thread mode and handler 
+		mode. The former is used to execute the "regular" code and can 
+		support privileged/unprivileged levels. The latter is used to 
+		handle exceptions and is always executed in privileged level.
+		After servicing the exception, the cpu returns to thread mode.
+
+			THREAD MODE EXEC.
+			...
+			...
+			...		-> INTERRUPT ->	HANDLER MODE EXEC.
+			...		<--------  	...
+			...			|	<kernel servicing>
+			...			|	...
+						------- END OF ROUTINE
+
+		So, hw and sw protection must be kernel supported by means of
+		request servicing of application's system call like: supervisor
+		call, SVC instruction.
+		If the action requested by the application is not allowed, an
+		exception is raised, and then kernel serviced.
+
+		Unprivileged:	- limited access to MSR & MRS instr.s, cannot 
+				  use CPS instr.
+				- cannot access the system timer, NVIC, system 
+				  control block
+				- might have restricted access to memory or
+				  peripherals.
+				- SVC instr. to make a supervisor call to 
+				  transfer control to privileged software.
+
+		Privileged:	- All the instructions and resources (also 
+				  CONTROL register to change the privilege level
+				  for sw execution)
+
+		The processor implements two stacks, the main stack and the 
+		process stack, with independent copies of the stack pointer. In
+		thread mode, the control register controls whether the processor
+		uses the main stack or the process stack. In handler mode the
+		processor always use the main stack.
+
+		PROC. MODE |  DESTINATION  |  PRIVILEGE   |  STACK
+
+		Thread	  --> application --> privileged --> main stack
+		                           |              -> process stack
+		                           -> unpriv.    --> main stack
+		                                          -> process stack
+
+		Handler   --> exc.hand.   --> privileged --> main stack
+
+		The system has a memory protection unit, which can raise 
+		exceptions when a fault occurs. The fault is related to memory 
+		transactions both fot instructions and data. This fault aborts
+		instruction accesses to "execute never" memory regions.

@@ -1,0 +1,7 @@
+The microcontroller STM32F401RE does not embeds any Memory Management Unit.
+The simplest thing to do is to disable the mmu support of the Linux kernel
+during compile time, during which also the programs to run must be compiled.
+This means that all the addresses are fixed and bounded to the physical ones.
+No dynamic memory (probably), no memori paging and swapping are performed.
+While swapping could be performed, this procedure wears out the flash write
+cycles, thus reducing the product lifespan.

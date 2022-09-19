@@ -1,0 +1,1286 @@
+KERNEL PORT TO STM32F401RE PLUS SOME BINARIES TO EXECUTE
+
+TARGET
+The chosen target is the microcontroller STM32F401RE, which is a commercial and
+easy to retrieve uC. It is a Cortex-M4 based M.C.U. with a base clock frequency
+of 84MHz, 512kB of Flash memory and 96kB of static RAM.
+The project is then demonstrated by means of the NUCLEO-F401RE development 
+board, which is also easily available.
+The didactictal scope of the project is to replicate the design flow for a soft 
+real-time embedded system based on Linux with a MMU-less device, taking also 
+into account the memory footprint for the minimal OS obtained with the kernel, 
+init and some small executables.
+
+KCONFIG
+First of all, the kernel needs to be configured before compiling it. This is
+done by using the tools provided with the Linux' Source Code. The starting point
+is the minimal base configuration. This is obtained with "make" targeting 
+"tinyconfig":
+	make ARCH=arm O=build/stm32f401re tinyconfig
+
+Note: while further specific Kconfig exist for STM32-based development boards,
+those boards use microcontrollers different from the STM32F401RE in clock 
+frequency and most importantly in Flash and Sram size. 
+The stm32_defconfig target already exists, but it supports by default too many
+features which rely on the additional HW resources provided by the boards 
+mentioned in arch/arm/mach-stm32/board-dt.c. It is pointless to start from this
+target and then remove most of the default configurations shipped with it...
+
+Then after that, a more useful configuration is produced.
+	make ARCH=arm O=build/stm32f401re menuconfig
+
+In the graphical menu, various modification to the configuration are performed.
+The following functionalities have been added:
+	General setup
+		Preemption Model
+			Preemptible Kernel
+		Configure standard kernel features
+			Enable support for printk
+	System Type
+		STMicroelectronics STM32 family 
+			(NOTE: kernel supports STM32F429, STM32F469, STM32F746,
+			STM32F769 and STM32H743. STM32F401 not present, so at 
+			the moment, none of the sub-selections is active)
+	Boot options
+		Kernel Execute-In-Place from ROM
+		XIP Kernel Physical Location (0x08000000 + BOOTLDR_SIZE + (DEV_TREE???))	
+	Executable file formats
+		Kernel support for flat binaries
+	Device Drivers
+		Character Devices
+			Enable TTY
+			Serial drivers
+				[8250/16550 and compatible serial support]
+				[Console on 8250/16550 and compatible serial port]
+				STMicroelectronics STM32 serial port support
+				Support for console on STM32
+	??? [Device Drivers -> Memory Technology Device (MTD) support] ???
+	File systems
+		Miscellaneous filesystems
+			Compressed ROM file system support (cramfs)
+			Support CramFs image directly mapped in physical memory
+
+
+
+KERNEL COMPILATION
+The kernel now needs to be compiled. The first concern is about the proper 
+cross-compilation toolchain. The compiler used is gcc-arm-linux-gnueabihf.
+It targets to the ARMhf architectures (which can also take advantage of
+DSP instructions), uses glibc as C library (either newlibc or uClib can be 
+used, but those are not standard). The only concern is about the full 
+compatibility with the Cortex-M instruction set.
+The compiler is invoked by the Makefile with the correct flag set for
+CROSS_COMPILE. The resulting command is:
+	make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -C build/stm32f401re -j4
+
+Note: the -jN is only for the host machine, which will dedicate 4 threads to
+the "make" workload.
+
+In quite short time, the object file vmlinux.o, the executable vmlinux and the
+executable image xipImage are produced.
+
+...
+
+KERNEL TINYFICATION
+The kernel's memory footprint is divided into two categories: ROM footprint and
+RAM footprint. The upper limit is set by the STM32F401's Flash size and Sram
+size.
+The ROM footprint is basically composed by the .text and .rodata sections, 
+while the RAM footprint is basically composed by the .data and .bss sections.
+
+After an initial compilation (in detail: KERNEL COMPILATION), the resulting 
+kernel have been analyzed with the size command to evaluate the kernel's memory
+footprint. The result:
+	size vmlinux
+	text	data	bss	dec	hex
+	974288	492333	169300	1635921	18f651
+
+The xipImage's text and data sections are very large with respect to the 
+available Flash (512kB) and Sram (96kB) respectively... It is quite clear that
+Linux won't fit in neither of the two...
+So, after this first compilation, the aim is to reduce the total kernel size.
+
+The first approach is to search for unused/not so useful parts of the kernel.
+This is done by using the command nm, useful to analyze the code's symbols.
+The used command is:
+	nm --size-sort --reverse-sort vmlinux | less
+
+Note: less is used only as a utility to enclose and search textually inside
+the stream produced by nm.
+
+The first elements in the list are related to the added printk support. To be
+more precise, the buffers and ring buffers used to store temporarily the data
+to be sent to the console.
+The kernel configuration documentation states that the ring buffer size can be
+adjusted using a parameter (N), where the size is 1 << N. This parameter can
+vary in the range of 12 to 17 (in this architecture). So by chosing 12, the 
+obtained buffer size is 4kB.
+So, in the graphical configuration menu:
+	General setup
+		Kernel log buffer size = 12
+Another parameter related to these buffers is temporary printk buffer. It 
+follows the same rules as the previous one, so:
+	General setup
+		Temporary per-CPU printk log buffer size = 12
+After a new compilation, the result is:
+	size vmlinux
+	text    data    bss     dec     hex
+	974288	87341	42324	1103953	10d851
+The bloat-o-meter report:
+add/remove: 0/0 grow/shrink: 0/7 up/down: 0/-270872 (-270872)
+Function                                     old     new   delta
+printk_safe_log_store                        164     156      -8
+__printk_safe_flush                          344     328     -16
+_printk_rb_static_descs                     3072    1536   -1536
+__log_buf                                   8192    4096   -4096
+_printk_rb_static_infos                    22528   11264  -11264
+safe_print_seq                            131072    4096 -126976
+nmi_print_seq                             131072    4096 -126976
+Total: Before=1244860, After=973988, chg -21.76%
+
+Now, re-analyzing the symbols reveals that now the biggest portion is a global
+text symbol related to the Human Interface Device support (~11kB). This 
+subsystem is the one responsible for the management of the various input 
+peripherals. Well, since the this kernel is aimed to a system which only support
+the serial port, the HID is still needed in order to allow this kind of 
+communication.
+
+A possible solution is to reduce the complexity of this code section, but this
+means that the code must be modified adding architecture specific code 
+optimizations selected by means of customized macros (in order to exclude code
+portions).
+This proposed solution is quite complex to implement and require knowledge that
+is not owned by the author of this experimental kernel port.
+
+[KERNEL TINYFICATION: SYSCALLS]
+A different solution can be the one aiming to a different target: the system
+calls. Basically, since this kernel is designed to be very simple and limited
+in functionalities, for sure some of the syscalls can be removed.
+A list of the implemented syscalls can be obtained by composing the command:
+	nm --size-sort --reverse-sort vmlinux | grep " sys_" (1)
+
+Piping the output to wc, it says that 429 syscalls are implemented (430, but one
+is the table of syscalls). There are a LOT of syscalls, almost certainly some of
+those can be removed. For example in this specific embedded system it is not 
+expected to have processes tracing other processes. This means that the ptrace 
+system call can be removed.
+List of syscalls (preceeded by their size and section membership):
+	3b8 T sys_prctl                  006 W sys_setregid
+	39e T sys_ioctl                  006 W sys_set_mempolicy
+	358 T sys_mount_setattr          006 W sys_setgroups16
+	356 T sys_ptrace                 006 W sys_setgroups
+	284 T sys_fsconfig               006 W sys_setgid16
+	1da T sys_rt_sigtimedwait        006 W sys_setgid
+	1d6 T sys_setns                  006 W sys_setfsuid16
+	1ac T sys_pivot_root             006 W sys_setfsuid
+	18c T sys_fsmount                006 W sys_setfsgid16
+	160 T sys_open_tree              006 W sys_setfsgid
+	140 T sys_setpriority            006 W sys_sendto
+	13e T sys_prlimit64              006 W sys_sendmsg
+	12c T sys_getpriority            006 W sys_sendmmsg
+	110 T sys_setpgid                006 W sys_send
+	10a T sys_sched_setattr          006 W sys_semtimedop_time32
+	0fc T sys_getcwd                 006 W sys_semtimedop
+	0fa T sys_splice                 006 W sys_semop
+	0f8 T sys_kill                   006 W sys_semget
+	0f2 T sys_copy_file_range        006 W sys_semctl
+	0e8 T sys_mremap                 006 W sys_seccomp
+	0c8 T sys_pidfd_send_signal      006 W sys_sched_rr_get_interval_time32
+	0c8 T sys_pidfd_getfd            006 W sys_s390_pci_mmio_write
+	0c0 T sys_fspick                 006 W sys_s390_pci_mmio_read
+	0ae T sys_waitid                 006 W sys_s390_ipc
+	0ac T sys_clock_nanosleep        006 W sys_rt_sigtimedwait_time32
+	0a8 T sys_sysinfo                006 W sys_rtas
+	0a4 T sys_sched_getattr          006 W sys_rseq
+	0a0 T sys_fsopen                 006 W sys_request_key
+	09c T sys_mount                  006 W sys_remap_file_pages
+	092 T sys_sigaction              006 W sys_recvmsg
+	084 T sys_pselect6               006 W sys_recvmmsg_time32
+	084 T sys_getdents64             006 W sys_recvmmsg
+	082 T sys_poll                   006 W sys_recvfrom
+	07e T sys_move_mount             006 W sys_recv
+	07a T sys_getdents               006 T sys_readv
+	07a T sys_fcntl64                006 W sys_quotactl
+	074 T sys_times                  006 W sys_pselect6_time32
+	072 T sys_sigprocmask            006 W sys_process_vm_writev
+	06e T sys_tee                    006 W sys_process_vm_readv
+	06e T sys_llseek                 006 W sys_process_madvise
+	06a T sys_rt_sigprocmask         006 W sys_ppoll_time32
+	068 T sys_settimeofday           006 W sys_pkey_mprotect
+	068 T sys_nice                   006 W sys_pkey_free
+	064 T sys_sched_rr_get_interval  006 W sys_pkey_alloc
+	064 T sys_chroot                 006 W sys_perf_event_open
+	064 T sys_chdir                  006 W sys_pciconfig_write
+	062 T sys_ppoll                  006 W sys_pciconfig_read
+	060 T sys_pidfd_open             006 W sys_pciconfig_iobase
+	060 T sys_gethostname            006 W sys_open_by_handle_at
+	05e T sys_fchdir                 006 T sys_openat
+	05a T sys_getrandom              006 W sys_old_shmctl
+	058 T sys_rt_tgsigqueueinfo      006 W sys_old_semctl
+	058 T sys_rt_sigqueueinfo        006 W sys_old_msgctl
+	056 T sys_syncfs                 006 T sys_ni_syscall
+	056 T sys_fsetxattr              006 W sys_nanosleep_time32
+	056 T sys_fcntl                  006 W sys_name_to_handle_at
+	054 T sys_sched_getparam         006 W sys_munlockall
+	052 T sys_sendfile64             006 W sys_munlock
+	050 T sys_utimensat              006 W sys_msync
+	050 T sys_sethostname            006 W sys_msgsnd
+	050 T sys_setdomainname          006 W sys_msgrcv
+	050 T sys_gettimeofday           006 W sys_msgget
+	04e T sys_lseek                  006 W sys_msgctl
+	048 T sys_sendfile               006 W sys_mq_unlink
+	048 T sys_openat2                006 W sys_mq_timedsend_time32
+	046 T sys_sigaltstack            006 W sys_mq_timedsend
+	044 T sys_rt_sigreturn           006 W sys_mq_timedreceive_time32
+	044 T sys_rt_sigaction           006 W sys_mq_timedreceive
+	044 T sys_brk                    006 W sys_mq_open
+	042 T sys_getsid                 006 W sys_mq_notify
+	042 T sys_fremovexattr           006 W sys_mq_getsetattr
+	042 T sys_fgetxattr              006 W sys_mprotect
+	03e T sys_dup2                   006 W sys_move_pages
+	03c T sys_sched_getaffinity      006 W sys_modify_ldt
+	03a T sys_getrusage              006 t sys_mmap2
+	03a T sys_clone                  006 W sys_mlockall
+	038 T sys_sched_getscheduler     006 W sys_mlock2
+	038 T sys_clock_getres           006 W sys_mlock
+	036 T sys_unlinkat               006 W sys_mincore
+	036 T sys_umount                 006 W sys_migrate_pages
+	036 T sys_old_mmap               006 W sys_memfd_create
+	034 T sys_timer_settime          006 W sys_membarrier
+	034 T sys_timer_gettime          006 W sys_mbind
+	034 T sys_timer_getoverrun       006 W sys_madvise
+	034 T sys_timer_delete           006 W sys_lookup_dcookie
+	034 T sys_timer_create           006 W sys_listen
+	034 T sys_sigreturn              006 W sys_lchown16
+	034 T sys_setitimer              006 W sys_keyctl
+	034 T sys_ni_posix_timers        006 W sys_kexec_load
+	034 T sys_getitimer              006 W sys_kexec_file_load
+	034 T sys_clock_adjtime32        006 W sys_kcmp
+	034 T sys_clock_adjtime          006 W sys_ipc
+	032 T sys_sched_setaffinity      006 W sys_io_uring_setup
+	032 T sys_flistxattr             006 W sys_io_uring_register
+	030 T sys_renameat2              006 W sys_io_uring_enter
+	030 T sys_fchmod                 006 W sys_io_submit
+	02c T sys_preadv2                006 W sys_io_setup
+	02c T sys_getrlimit              006 W sys_ioprio_set
+	02c T sys_execveat               006 W sys_ioprio_get
+	02c T sys_dup                    006 W sys_io_pgetevents_time32
+	02a T sys_umask                  006 W sys_io_pgetevents
+	02a T sys_renameat               006 W sys_io_getevents_time32
+	02a T sys_pwritev2               006 W sys_io_getevents
+	028 T sys_vfork                  006 W sys_io_destroy
+	028 T sys_pause                  006 W sys_io_cancel
+	028 T sys_getppid                006 W sys_inotify_rm_watch
+	026 T sys_wait4                  006 W sys_inotify_init1
+	026 T sys_setrlimit              006 W sys_inotify_init
+	026 T sys_rt_sigpending          006 W sys_inotify_add_watch
+	026 T sys_rename                 006 W sys_init_module
+	026 T sys_clock_settime          006 W sys_getuid16
+	024 t sys_syscall                006 W sys_getsockopt
+	024 T sys_statfs64               006 W sys_getsockname
+	024 T sys_getcpu                 006 W sys_get_robust_list
+	024 T sys_fstatfs64              006 W sys_getresuid16
+	024 T sys_close                  006 W sys_getresuid
+	022 T sys_sched_get_priority_min 006 W sys_getresgid16
+	022 T sys_sched_get_priority_max 006 W sys_getresgid
+	022 T sys_rt_sigsuspend          006 T sys_getpgrp
+	020 T sys_old_select             006 W sys_getpeername
+	020 T sys_mknod                  006 W sys_get_mempolicy
+	020 T sys_execve                 006 W sys_getgroups16
+	020 T sys_clock_gettime          006 W sys_getgroups
+	01c T sys_personality            006 W sys_getgid16
+	01c T sys_mknodat                006 W sys_geteuid16
+	01c T sys_lchown                 006 W sys_getegid16
+	01a T sys_statfs                 006 W sys_futimesat_time32
+	01a T sys_sigpending             006 W sys_futex_time32
+	01a T sys_set_tid_address        006 W sys_futex
+	01a T sys_link                   006 T sys_fork
+	01a T sys_fstatfs                006 W sys_flock
+	01a T sys_chown                  006 W sys_finit_module
+	018 T sys_sched_setscheduler     006 W sys_fchown16
+	016 T sys_sync_file_range2       006 W sys_fanotify_mark
+	016 T sys_restart_syscall        006 W sys_fanotify_init
+	014 T sys_unlink                 006 W sys_fadvise64_64
+	014 T sys_sigsuspend             006 W sys_fadvise64
+	014 T sys_rmdir                  006 W sys_eventfd2
+	014 T sys_pwritev                006 W sys_eventfd
+	014 T sys_preadv                 006 W sys_epoll_wait
+	014 T sys_gettid                 006 W sys_epoll_pwait2
+	014 T sys_getpid                 006 W sys_epoll_pwait
+	014 T sys_ftruncate              006 W sys_epoll_ctl
+	012 T sys_tkill                  006 W sys_epoll_create1
+	012 T sys_tgkill                 006 W sys_epoll_create
+	012 T sys_setxattr               006 W sys_delete_module
+	012 T sys_lsetxattr              006 W sys_connect
+	010 T sys_sched_setparam         006 W sys_clock_settime32
+	010 T sys_ftruncate64            006 W sys_clock_nanosleep_time32
+	010 T sys_creat                  006 W sys_clock_gettime32
+	00e T sys_open                   006 W sys_clock_getres_time32
+	00e T sys_lgetxattr              006 W sys_chown16
+	00e T sys_getxattr               006 W sys_capset
+	00c t sys_statfs64_wrapper       006 W sys_capget
+	00c T sys_sched_yield            006 W sys_bpf
+	00c T sys_readlink               006 W sys_bind
+	00c t sys_fstatfs64_wrapper      006 W sys_bdflush
+	00c T sys_exit_group             006 T sys_arm_fadvise64_64
+	00c T sys_exit                   006 W sys_adjtimex_time32
+	00c T sys_access                 006 W sys_add_key
+	00a T sys_vhangup                006 W sys_acct
+	00a T sys_sync                   006 W sys_accept4
+	00a t sys_sigreturn_wrapper      006 W sys_accept
+	00a t sys_rt_sigreturn_wrapper   004 T sys_writev
+	00a T sys_mkdir                  004 T sys_write
+	00a T sys_chmod                  004 T sys_vmsplice
+	008 B sys_tz                     004 T sys_unshare
+	008 T sys_truncate               004 T sys_truncate64
+	008 T sys_symlink                004 T sys_sync_file_range
+	006 W sys_vm86old                004 T sys_statx
+	006 W sys_vm86                   004 T sys_setsid
+	006 W sys_utimes_time32          004 T sys_removexattr
+	006 W sys_utimensat_time32       004 T sys_readahead
+	006 W sys_utime32                004 T sys_read
+	006 W sys_userfaultfd            004 T sys_pwrite64
+	006 W sys_uselib                 004 T sys_pread64
+	006 W sys_timer_settime32        004 T sys_pipe
+	006 W sys_timer_gettime32        004 T sys_newuname
+	006 W sys_timerfd_settime32      004 T sys_munmap
+	006 W sys_timerfd_settime        004 T sys_mmap_pgoff
+	006 W sys_timerfd_gettime32      004 T sys_mkdirat
+	006 W sys_timerfd_gettime        004 T sys_lremovexattr
+	006 W sys_timerfd_create         004 T sys_llistxattr
+	006 W sys_time32                 004 T sys_listxattr
+	006 T sys_syslog                 004 T sys_getuid
+	006 W sys_sysfs                  004 T sys_getpgid
+	006 W sys_swapon                 004 T sys_getgid
+	006 W sys_swapoff                004 T sys_geteuid
+	006 W sys_subpage_prot           004 T sys_getegid
+	006 W sys_stime32                004 T sys_fsync
+	006 W sys_ssetmask               004 T sys_fdatasync
+	006 W sys_spu_run                004 T sys_fchownat
+	006 W sys_spu_create             004 T sys_fchown
+	006 W sys_socketpair             004 T sys_fchmodat
+	006 W sys_socketcall             004 T sys_fallocate
+	006 W sys_socket                 004 T sys_faccessat
+	006 W sys_signalfd4              004 T sys_dup3
+	006 W sys_signalfd               004 T sys_close_range
+	006 W sys_shutdown               002 T sys_ustat
+	006 W sys_shmget                 002 T sys_symlinkat
+	006 W sys_shmdt                  002 T sys_stat64
+	006 W sys_shmctl                 002 T sys_select
+	006 W sys_shmat                  002 T sys_reboot
+	006 W sys_sgetmask               002 T sys_readlinkat
+	006 W sys_setuid16               002 T sys_pipe2
+	006 W sys_setuid                 002 T sys_newstat
+	006 W sys_setsockopt             002 T sys_newlstat
+	006 W sys_set_robust_list        002 T sys_newfstat
+	006 W sys_setreuid16             002 T sys_lstat64
+	006 W sys_setreuid               002 T sys_linkat
+	006 W sys_setresuid16            002 T sys_fstatat64
+	006 W sys_setresuid              002 T sys_fstat64
+	006 W sys_setresgid16            002 T sys_faccessat2
+	006 W sys_setresgid              002 T sys_clone3
+	006 W sys_setregid16
+
+Note: removing a syscall reduce not simply by its .text shown by the (1) 
+command. All the nested calls are also removed and so all their .text, .rodata,
+.data and .bss sections. This gain may be very significant.
+
+Note: some syscalls are present in more variants. The best practice to reduce
+size without losing functionalities is to keep the most complete one and
+removing the others.
+
+[KERNEL-BUILD TOOLCHAIN CUSTOMIZATION]
+In order to remove a system call, a series of changes have to be applied to the
+kernel source tree and building chain.
+First of all, the said syscall has to be made conditional by adding a related
+Kconfig symbol int the init/Kconfig file (so graphically configurable by 
+menuconfig). 
+The structure of these customizations, on menuconfig side, is placed under 
+"General setup -> Configure standard kernel features" and is the following:
+	...
+	[ ] ! ! ! ALLOW DANGEROUS CUSTOMIZATIONS ! ! ! --->
+		[*] Enable ptrace() syscall
+		[*] Enable fallocate() syscall
+		[*] Enable time related system calls --->
+			[*] Enable times() syscall
+			[*] ...
+		[*] ...
+This structure is organized in this way to enable/disable system calls 
+singularly (like "Enable ptrace() syscall" or "Enable times() syscall"), or by
+functionality group (like "Enable time related system calls").
+The added Kconfig structure is made in order to support menu hierarchy and is
+the following:
+	menuconfig TINY_EXPERIMENTAL
+	        bool "! ! ! ALLOW DANGEROUS CUSTOMIZATIONS ! ! !" if EXPERT
+	        default n
+	        help
+		  ...
+	
+	if TINY_EXPERIMENTAL
+	
+	config XXX_SYSCALL
+	        bool "Enable xxx() syscall" if TINY_EXPERIMENTAL
+	        default y
+	        help
+		  ...
+	
+	...
+	
+	menuconfig YYYGROUP_SYSCALLS
+		bool "Enable yyy related system calls"
+	        default y
+	        help
+		  ...
+	
+	if YYYGROUP_SYSCALLS
+	
+	config ZZZ_SYSCALL
+		bool "Enable xxx() syscall" if TINY_EXPERIMENTAL
+	        default y
+	        help
+		  ...
+	
+	...
+	
+	endif # YYYGROUP_SYSCALLS
+	
+	...
+	
+	endif # TINY_EXPERIMENTAL
+
+TINY_EXPERIMENTAL is a boolean variable added to allow the selection of these
+custom changes on the syscalls. It acts as an enable for the customizations to
+the kernel.
+Then, to every syscall which is intended to be made conditional is associated a
+unique Kconfig symbol. This symbol will be used inside the respective Makefile
+responsible for the linkage (basically, every conditional syscall is made so by
+making its symbol weak and fall to the function sys_ni_syscall if no linkage is
+made on the symbol) (sys_ni_syscall is a "parachute" syscall which will simply
+return ENOSYS, the error for the missing system call).
+
+Then, the system call is made conditional by modifying the file kernel/sys_ni.c
+and using the macro COND_SYSCALL(<syscall>), which is defined inside the file 
+include/linux/linkage.h. The macro is placed in the file line with the a comment
+regarding the source of that syscall (these comments are already present for 
+every syscall).
+
+Finally, the respective Makefile is modified in order to change the set of 
+object file to include in the kernel (so, the syscall won't have a strong link
+to its code, but fall as just said above). The correct Makefile is inside the 
+directory which contains the sources file where the syscall are defined.
+
+Now, in order to test if the new changes affect the system in a bad way, a test
+over the ptrace() syscall is performed. The only modification is now made 
+around ptrace() only, and a new compilation is performed leaving the 
+PTRACE_SYSCALL symbol active, just to test if the produced kernel is the same 
+as the one obtained in the previous step. The previous kernel has been renamed
+as "vmlinux.ref".
+This is performed around the script "new_compile.sh", just to automate things
+and avoid human errors. It is executed with the argument "-ref", in order to 
+compare the new kernel against "vmlinux.ref" instead of "vmlinux.old".
+The report around this compilation is:
+	New kernel size
+	   text	   data	    bss	    dec	    hex	filename
+	 974288	  87341	  42324	1103953	 10d851	build/stm32f401re/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 0/0 grow/shrink: 0/0 up/down: 0/0 (0)
+	Function                                     old     new   delta
+	Total: Before=973988, After=973988, chg +0.00%
+Which means that the two kernels ("vmlinux" and "vmlinux.ref") are identical.
+
+Now, let's try to see what happens if the ptrace() only is removed. In order to
+do so, un-check the "Enable ptrace() syscall" in menuconfig. Then, a new 
+compilation is performed and compared against "vmlinux.ref"
+
+Well, some errors occurred:
+arm-linux-gnueabihf-ld: arch/arm/kernel/ptrace.o: in function `arch_ptrace':
+ptrace.c:(.text+0x316): undefined reference to `ptrace_request'
+arm-linux-gnueabihf-ld: kernel/fork.o: in function `mm_access':
+fork.c:(.text+0x802): undefined reference to `ptrace_may_access'
+arm-linux-gnueabihf-ld: kernel/fork.o: in function `copy_process':
+fork.c:(.text+0x116e): undefined reference to `__ptrace_link'
+arm-linux-gnueabihf-ld: kernel/exit.o: in function `release_task':
+exit.c:(.text+0x298): undefined reference to `__ptrace_unlink'
+arm-linux-gnueabihf-ld: kernel/exit.o: in function `wait_consider_task':
+exit.c:(.text+0x83a): undefined reference to `__ptrace_unlink'
+arm-linux-gnueabihf-ld: kernel/exit.o: in function `do_exit':
+exit.c:(.text+0xf5e): undefined reference to `exit_ptrace'
+arm-linux-gnueabihf-ld: kernel/pid.o: in function `__se_sys_pidfd_getfd':
+pid.c:(.text+0x752): undefined reference to `ptrace_may_access'
+arm-linux-gnueabihf-ld: kernel/nsproxy.o: in function `__se_sys_setns':
+nsproxy.c:(.text+0x406): undefined reference to `ptrace_may_access'
+
+As can be read, this is due to the dependencies of other functions to some 
+functions which were defined inside the ptrace.o object file, which was removed
+by the Makefile obj-y's default list. In order to overcome these issues, two 
+solutions exist: link ptrace.o anyway for the other syscalls, or analyze the 
+other dependencies and search for possible simplifications (partial in-place 
+re-write or add macros to avoid the call if possible, keeping in mind that 
+having removed the ptrace() also removes the race conditions, over kernel's data
+structures, related to it).
+
+What happens if in the Makefile is kept the ptrace.o unconditionally?
+If done so, the compiled kernel result in:
+	New kernel size
+	   text	   data	    bss	    dec	    hex	filename
+	 973384	  87349	  42324	1103057	 10d4d1	build/stm32f401re/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 0/2 grow/shrink: 2/2 up/down: 86/-966 (-880)
+	Function                                     old     new   delta
+	ptrace_may_access                             36     120     +84
+	ptrace_get_syscall_info                      282     284      +2
+	ptrace_request                              1152    1150      -2
+	task_unlock.constprop                        270     240     -30
+	__ptrace_may_access                           80       -     -80
+	sys_ptrace                                   854       -    -854
+	Total: Before=973988, After=973108, chg -0.09%
+Now, sys_ptrace is removed, but some things have shrinked, some have grown... 
+But most noticeably, the other functions still hold quite some code...
+Quite some questions now arise... Who calls ptrace_request? In order to answer
+to this question the obtained kernel is disassembled:
+	arm-linux-gnueabihf-objdump -D build/stm32f401re/vmlinux.o | less
+Searching the occurrences of ptrace_request, the caller is found recursively: 
+	ptrace_request is called by arch_ptrace (without surprise, already known
+		by looking at the source code...).
+	arch_ptrace is called by show_rcu_tasks_gp_kthreads
+	show_rcu_task_gp_kthreads is called by show_rcu_gp_kthreads
+	show_rcu_gp_kthreads is called by rcu_fwd_progress_check
+And there it stops: no explicit caller can be found. It has to do with the 
+Read-Copy Update, more precisely with the forward progress check, due to threads
+synchronization... It doesn't sound too easy to overcome...
+
+With regard to ptrace_may_access, it is called by mm_access, 
+__se_sys_pidfd_getfd and __se_sys_setns. What can be done is to modify the 
+ptrace_may_access code by analyzing what the functions should return, keeping in
+mind that now, no ptrace can occurr. Unfortunately, the name of this functions 
+is misleading: its general usage is to check whether the caller is permitted to 
+access a target task, so not limited to ptrace case. This means that it cannot 
+be removed...
+
+Now let's analyze another thing that is referred into ptrace.o: exit_ptrace.
+This function is called by do_exit, which is called after one of the possible 
+process exit scenarios. The exit_ptrace is called by the process which exits, 
+because in case it is a tracer for a set of tracee processes, those must be 
+detached or killed. Now yes, in this case, since no ptrace can be executed, no
+process can be a tracer, and thus this code can be removed without problems.
+Now, the best practice in terms of code organization is not to modify every 
+source file which calls the exit_ptrace, but instead keep the ptrace-related 
+changes as little and as centralized as possible. So, leave those functions 
+which call it as they are and modify the exit_ptrace body by means of 
+conditional compilation around the CONFIG_PTRACE_SYSCALL symbol. The new 
+exit_ptrace function looks like this:
+	void exit_ptrace(struct task_struct *tracer, struct list_head *dead)
+	{
+	#ifdef CONFIG_PTRACE_SYSCALL
+	        struct task_struct *p, *n;
+	
+	        list_for_each_entry_safe(p, n, &tracer->ptraced, ptrace_entry) {
+	                if (unlikely(p->ptrace & PT_EXITKILL))
+	                        send_sig_info(SIGKILL, SEND_SIG_PRIV, p);
+	
+	                if (__ptrace_detach(tracer, p))
+	                        list_add(&p->ptrace_entry, dead);
+	        }
+	#endif
+	}
+A new compilation reveals how much has been saved in terms of .text:
+	New kernel size
+	   text	   data	    bss	    dec	    hex	filename
+	 973288	  87349	  42324	1102961	 10d471	build/stm32f401re/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 0/1 grow/shrink: 2/1 up/down: 128/-248 (-120)
+	Function                                     old     new   delta
+	ptrace_request                              1150    1276    +126
+	ptrace_resume                                152     154      +2
+	exit_ptrace                                  108       2    -106
+	__ptrace_detach.part                         142       -    -142
+	Total: Before=973108, After=972988, chg -0.01%
+Which is still very little... But the exit_ptrace effect is visible.
+Now, let's deeply analyze the ptrace_request. Well, until now it has been 
+considered not removable because of a chain of dependencies... To be honest, the
+dependency of arch_ptrace to higher hierarchies levels is not explicitly linked
+to ptrace_request: the code of arch_ptrace is a "switch" statement where only 
+one "case" has the effect of calling ptrace_request. If it is possible to check
+that the higher level functions never passes the argument which cause the 
+ptrace_request, well, even the latter can be removed. But something strange 
+happened to the code: disassembling the code, it can be seen that in the object
+file arch_ptrace is called by show_rcu_task_kthreads, while in the executable
+code no function ever calls arch_ptrace explicitly...
+	vmlinux.o:
+		0001fca0 <show_rcu_tasks_gp_kthreads>:
+		   1fca0:       f7ff bffe       b.w     9c8 <arch_ptrace+0x3c>
+	vmlinux:
+		08028760 <show_rcu_tasks_gp_kthreads>:
+		 8028760:       f093 bb5a       b.w     80bbe18 <show_rcu_tasks_
+							classic_gp_kthread>
+Note: this outcome is not expected. This goes beyond the author comprension 
+(which suggests that a link is a matter of address binding, and seems that 
+something different happened since now the extended-32bit-branch goes to a 
+different address/label). 
+
+
+# The ptrace_get_syscall_info is called by ptrace_request.
+# The ptrace_may_access is called in various part, due to possible ptrace accesses
+# or race conditions. Since now it is removed, it can be enclosed around a macro
+# over the CONFIG_PTRACE_SYSCALL symbol.
+# 
+# 
+# removed ptrace() syscall. In order to repair the missing references, an already
+# coditional syscall can be analyzed: the advise related syscalls.
+# A first exploration can be done by performing at the root level of the source 
+# tree the following command to search for all the symbol occurences:
+# 	grep -rn --color=always CONFIG_ADVISE_SYSCALLS . | grep -v "\./build"
+# Then, comparing this output with the one from the command:
+# 	grep -rn --color=always SYSCALL_DEFINE . | grep -v "\./build" | grep \
+# 	--color=always fadvise
+# Analyzing the two streams make clear that a preprocessor directive is used to
+# enclose the syscall entry point (SYSCALL_DEFINE) around the conditional block
+# depending on its symbol (CONFIG_ADVISE_SYSCALLS).
+# So, let's now proceed and enclose the entry point for ptrace() aroud a test over
+# its respective Kconfig symbol.
+####
+
+Finally, compile out the syscall entry point (SYSCALL_DEFINE)
+Of course, the Makefiles present in the respective source tree's leaves must be
+modify in order to not compile and link the removed syscalls.
+
+the kernel's Makefile needs to be changed.
+The main idea is to exclude from [...]
+
+The syscalls set which will be removed is (sorted by (1)):
+	ptrace: tracer-tracee relationship won't be supported
+	times: a process' CPU time won't be track-able
+	settimeofday: time change not supported
+	gettimeofday: time access not supported
+	getitimer: support instead only the POSIX's timer_gettime (higher res.)
+	setitimer: support instead only the POSIX's timer_settime (higher res.)
+	clock_adjtime: do not support kernel clock tuning
+	ntp_adjtime: do not support kernel clock tuning
+	adjtimex: do not support kernel clock tuning
+	clock_settime: do not support clocks
+	clock_gettime: do not support clocks
+	clock_getres: do not support clocks
+	clock_nanosleep: do not support clocks
+	utime: file last access modification won't be supported
+	utimes: file last access modification won't be supported
+	utimensat: file timestamps won't be supported
+	futimens: file timestamps won't be supported
+	stime: time won't be set-able
+	futimesat: file descriptor timestamp won't be supported (obsolete)
+	
+	vm86: virtual 8086 mode won't be supported
+	vm86old: virtual 8086 mode won't be supported
+
+
+	shm & mq: support both, only one or none?
+	select: outdated, use poll/ppoll (also no limit on # of file descr.s)
+	pselect: (pselect6) same reason as select (from man consultation)
+	socket: ??? (i don't think i will support it...)
+	recvmmsg: socket dependent
+	adjtime/adjtimex/ntp (Time related syscalls: No HW clock on-board)
+	fallocate (no real appreciable performance improvement)
+
+	old_mmap: old system calls won't be supported
+	old_select: old system calls won't be supported
+	old_shmctl: old system calls won't be supported
+	old_semctl: old system calls won't be supported
+	old_msgctl: old system calls won't be supported
+	
+Note: the support to signals is kept as a way for processes to interact with 
+each other.
+
+Note: since the HW clock on-board is not persistent (ext.supply needed), 
+time/time32 can be used to get the system up-time.
+
+
+Now, the same flow is applied to the other syscalls. A simple but fast and 
+effective way to find the entry point and the syscall definition is to execute
+the following command at the root of the kernel source tree:
+	grep -rn --color=always "SYSCALL_DEFINE.(<name>" . | grep -v "\./build"
+Once found the file, add the conditional-izing statement in sys_ni.c file at 
+the right line where the file is cited. Then a compilation is performed and 
+compared against the reference kernel.
+times:
+	kernel/sys_ni.c:	COND_SYSCALL(times);
+	kernel/sys.c:		#ifdef CONFIG_TIMES_SYSCALL
+				SYSCALL_DEFINE1(times, ...)
+				{...}
+				#endif
+	kernel/Makefile:	<un-removable obj module>
+	Net result:	Bloat-o-meter gain calculation
+			add/remove: 0/1 grow/shrink: 0/0 up/down: 0/-116 (-116)
+			Function		old     new   delta
+			sys_times		116       -    -116
+			Total: Before=973988, After=973872, chg -0.01%
+gettimeofday & settimeofday:
+	kernel/sys_ni.c:	COND_SYSCALL(gettimeofday);
+				COND_SYSCALL(settimeofday);
+	kernel/time/time.c:	#ifdef CONFIG_XETTIMEOFDAY_SYSCALLS
+				SYSCALL_DEFINE2(gettimeofday, ...) {...}
+				...
+				SYSCALL_DEFINE2(settimeofday, ...) {...}
+				#endif
+	kernel/Makefile:	<un-removable obj module>
+	Note: an error occurred while loading because the syscall clock_settime
+	use a subroutine of settimeofday. Since it is made possible to select
+	the syscalls independently, the do_sys_settimeofday64 must be kept 
+	outside the condition around the CONFIG_XETTIMEOFDAY_SYSCALL.
+	Net result:	Bloat-o-meter gain calculation
+			add/remove: 0/2 grow/shrink: 0/0 up/down: 0/-184 (-184)
+			Function		old     new   delta
+			sys_gettimeofday	 80       -     -80
+			sys_settimeofday	104       -    -104
+			Total: Before=973988, After=973804, chg -0.02%
+getitimer & setitimer:
+	Note: these two syscalls are not present if CONFIG_POSIX_TIMERS is not 
+	defined. Skipped.
+clock_adjtime, clock_adjtime32, adjtimex & adjtimex_time32:
+	kernel/sys_ni.c		COND_SYSCALL(clock_adjtime);
+				COND_SYSCALL(clock_adjtime32);
+				COND_SYSCALL(adjtimex);
+				COND_SYSCALL(adjtimex_time32);
+	// /time/posix-timers.c:#ifdef CONFIG_KCLOCKTUNE_SYSCALLS
+				SYSCALL_DEFINE2(clock_adjtime, ...) {...}
+				...
+				SYSCALL_DEFINE2(clock_adjtime32, ...) {...}
+				#endif
+	kernel/time/time.c:	#ifdef CONFIG_KCLOCKTUNE_SYSCALLS
+				SYSCALL_DEFINE1(adjtimex, ...) {...}
+				...
+				SYSCALL_DEFINE1(adjtimex_time32, ...) {...}
+				#endif
+	Note: from now on, the results won't be reported for every single 
+	remotion, but a final report with everything applied will be given.
+	Note: the syscalls have not been removed! Seems like these functions 
+	cannot be removed...
+clock_settime, clock_gettime, clock_getres: CONFIG_CLOCKTIME_SYSCALLS.
+	The definitions also exist in kernel/time/posix-stubs.c, but these can't
+	be removed because the stubs are used as a fallback in case POSIX timers
+	are not enabled in the kernel configuration.
+	Note: also in this case seems to be not possible to remove these 
+	syscalls...
+...
+utime, utime32, utimes & utimes_time32:
+	kernel/sys_ni.c:	COND_SYSCALL(utime);
+				COND_SYSCALL(utimes);
+				// already conditional
+				COND_SYSCALL(utime32);
+				// already conditional
+				COND_SYSCALL(utimes_time32);
+	fs/utimes.c:		#ifdef CONFIG_UTIMEX_SYSCALLS
+				SYSCALL_DEFINE2(utime, ...) {...}
+				...
+				SYSCALL_DEFINE2(utimes, ...) {...}
+				...
+				// already conditional
+				SYSCALL_DEFINE2(utime32, ...) {...}
+				...
+				// already conditional
+				SYSCALL_DEFINE2(utimes_time32, ...) {...}
+				#endif
+	Note: also in this case, the kernel haven't changed...
+utimensat & utimensat_time32:
+	kernel/sys_ni.c:	COND_SYSCALL(utimensat);
+				// already conditional
+				COND_SYSCALL(utimensat_time32);
+	fs/utimes.c:		#ifdef CONFIG_UTIMENSAT_SYSCALLS
+				SYSCALL_DEFINE4(utimensat, ...) {...}
+				...
+				SYSCALLS_DEFINE4(utimensat_time32) {...}
+				#endif
+	Note:Total: Before=973988, After=973908, chg -0.01%
+futimesat & futimesat_time32:
+	kernel/sys_ni.c:	COND_SYSCALL(futimesat);
+				// already conditional
+				COND_SYSCALL(futimesat_time32);
+	fs/utimes.c:		#ifdef CONFIG_FUTIMESAT_SYSCALL
+				SYSCALL_DEFINE3(futimesat, ...) {...}
+				...
+				SYSCALL_DEFINE3(futimesat_time32, ...) {...}
+				#endif
+	Note: no kernel size improvement...
+stime & stime32:
+	kernel/sys_ni.c:	COND_SYSCALL(stime);
+				// already conditional
+				CONS_SYSCALL(stime32);
+	kernel/time/time.c:	#ifdef CONFIG_STIME_SYSCALL
+				SYSCALL_DEFINE1(stime, ...) {...}
+				...
+				SYSCALL_DEFINE1(stime32, ...) {...}
+				#endif
+	Note: no improvement...
+clock_nanosleep & clock_nanosleep_time32:
+	kernel/sys_ni.c:	COND_SYSCALL(clock_nanosleep);
+				// already conditional
+				COND_SYSCALL(clock_nanosleep_time32);
+	k.l/time/posix-timers.c:#ifdef CONFIG_CLOCKNANO_SYSCALL
+				SYSCALL_DEFINE(clock_nanosleep) {...}
+				...
+				SYSCALL_DEFINE(clock_nanosleep_time32) {...}
+				#endif
+	Note: no improvement...
+old_select, select, pselect6, pselect6_time32 & pselect6_time64:
+	kernel/sys_ni.c:	COND_SYSCALL(old_select);
+				COND_SYSCALL_COMPAT(old_select);
+				COND_SYSCALL(select);
+				COND_SYSCALL_COMPAT(select);
+				COND_SYSCALL(pselect6n);
+				COND_SYSCALL_COMPAT(pselect6_time64);
+				// already conditional
+				COND_SYSCALL(pselect6_time32);
+				// already conditional
+				COND_SYSCALL_COMPAT(pselect6_time32);
+	fs/select.c:		#ifdef CONFIG_XSELECT_SYSCALLS
+				SYSCALL_DEFINE1(old_select) {...}
+				SYSCALL_DEFINE6(select) {...}
+				SYSCALL_DEFINE6(pselect6) {...}
+				SYSCALL_DEFINE6(pselect6_time32) {...}
+				COMPAT_SYSCALL_DEFINE1(old_select) {...}
+				COMPAT_SYSCALL_DEFINE6(select) {...}
+				COMPAT_SYSCALL_DEFINE6(pselect6_time64) {...}
+				COMPAT_SYSCALL_DEFINE6(pselect6_time32) {...}
+				#endif
+	Note: Total: Before=973988, After=973654, chg -0.03%
+fallocate:
+	kernel/sys_ni.c:	COND_SYSCALL(fallocate);
+	fs/open.c:		#ifdef CONFIG_FALLOCATE_SYSCALL
+				SYSCALL_DEFINE4(fallocate, ...) {...}
+				#endif
+	Note: Total: Before=973988, After=973984, chg -0.00% (almost null gain)
+old_mmap, old_shmctl, old_semctl, old_msgctl:
+	kernel/sys_ni.c:	COND_SYSCALL(old_mmap);
+	mm/mmap.c:		#ifdef CONFIG_OLDMMAP_SYSCALL
+				SYSCALL_DEFINE1(old_mmap, ...) {...}
+				#endif
+	mm/nommu.c:		#ifdef CONFIG_OLDMMAP_SYSCALL
+                                SYSCALL_DEFINE1(old_mmap, ...) {...}
+                                #endif
+	Note: Actually, old_shmctl and old_msgctl are already not present in the
+	final kernel due to ipc communicaiton not being supported. Same goes for
+	old_semctl.
+	Note: Total: Before=973988, After=973936, chg -0.01%
+
+Now, compiling with everything disabled produce the following result:
+New kernel size
+   text	   data	    bss	    dec	    hex	filename
+ 972440	  87349	  42324	1102113	 10d121	build/stm32f401re/vmlinux
+Bloat-o-meter gain calculation
+add/remove: 0/14 grow/shrink: 7/2 up/down: 422/-2192 (-1770)
+Function                                     old     new   delta
+sys_ppoll                                     98     304    +206
+ptrace_request                              1152    1276    +124
+ptrace_may_access                             36     120     +84
+sys_poll                                     130     132      +2
+split_vma                                    260     262      +2
+ptrace_resume                                152     154      +2
+ptrace_get_syscall_info                      282     284      +2
+sys_select                                     2       -      -2
+sys_fallocate                                  4       -      -4
+task_unlock.constprop                        270     240     -30
+sys_old_select                                32       -     -32
+sys_old_mmap                                  54       -     -54
+sys_utimensat                                 80       -     -80
+sys_gettimeofday                              80       -     -80
+__ptrace_may_access                           80       -     -80
+sys_settimeofday                             104       -    -104
+exit_ptrace                                  108       2    -106
+kern_select                                  112       -    -112
+sys_times                                    116       -    -116
+sys_pselect6                                 132       -    -132
+__ptrace_detach.part                         142       -    -142
+poll_select_finish                           264       -    -264
+sys_ptrace                                   854       -    -854
+Total: Before=973988, After=972218, chg -0.18%
+
+Well... It is not that much of a saving... 1770 net bytes less... It would be 
+really nice to completely remove the ptrace_request and almost doubling the gain
+that has been obtained.
+
+To further search between the implemented syscalls which one could be removed,
+a list of these can be retrieved by executing the following command:
+	arm-linux-gnueabihf-objdump -S build/stm32f401re/vmlinux | 
+	grep "^[0-9\|a-f]\+ <.*sys_.*>:" | less
+Note: NOT ALL the lines are syscalls, but sure mostly are.
+
+The syscall remotion way is quite long and it doesn't produce the hoped results.
+
+
+[KERNEL TINYFICATION: OBJ-FILES COMPILE OUT]
+Now, giving a look inside the disassembled code of the kernel, some ntp-related
+parts are still there, even after the ntp disabling... What happens if the 
+respective Makefile is modified in order to remove from the obj-y list the 
+file? In the case of the ptrace.o, it was not possible... Let's try it out on 
+the ntp.o. In order to support the compile-out, new labels are introduced in the
+init/Kconfig:
+	menuconfig COMPILE_INFRASTRUCTURE
+		bool "Enable object file inclusion"
+	        default y
+	        help
+		  Remove the unused but still linked object files from the kernel
+		  to reduce memory footprint.
+	
+	if COMPILE_INFRASTRUCTURE
+	
+	config NTP_OBJ
+		bool "Keep ntp.o file in linkage list"
+	        default y
+	        help
+		  Keep linking the ntp.o file
+	...
+	endif # COMPILE_INFRASTRUCTURE
+
+The kernel/time/Makefile is modified by splitting the list in a fixed one and a 
+conditionally added element as shown:
+	########################################################################
+	#       OLD obj-y LIST                                                 #
+	########################################################################
+	# obj-y += timekeeping.o ntp.o clocksource.o jiffies.o timer_list.o
+	########################################################################
+	#       NEW obj-y LIST                                                 #
+	########################################################################
+	obj-$(CONFIG_NTP_OBJ) += ntp.o
+	obj-y += timekeeping.o clocksource.o jiffies.o timer_list.o
+
+
+Disabling it and recompiling, produce some errors, like the ptrace case:
+arm-linux-gnueabihf-ld: kernel/time/timekeeping.o: in function `timekeeping_update':
+timekeeping.c:(.text+0x46e): undefined reference to `ntp_clear'
+arm-linux-gnueabihf-ld: timekeeping.c:(.text+0x472): undefined reference to `ntp_get_next_leap'
+arm-linux-gnueabihf-ld: kernel/time/timekeeping.o: in function `accumulate_nsecs_to_secs.constprop.0':
+timekeeping.c:(.text+0x72e): undefined reference to `second_overflow'
+arm-linux-gnueabihf-ld: kernel/time/timekeeping.o: in function `timekeeping_advance':
+timekeeping.c:(.text+0x804): undefined reference to `ntp_tick_length'
+arm-linux-gnueabihf-ld: timekeeping.c:(.text+0x832): undefined reference to `ntp_tick_length'
+arm-linux-gnueabihf-ld: timekeeping.c:(.text+0xa90): undefined reference to `ntp_tick_length'
+arm-linux-gnueabihf-ld: kernel/time/timekeeping.o: in function `do_adjtimex':
+timekeeping.c:(.text+0x200a): undefined reference to `__do_adjtimex'
+arm-linux-gnueabihf-ld: timekeeping.c:(.text+0x2032): undefined reference to `ntp_get_next_leap'
+arm-linux-gnueabihf-ld: kernel/time/timekeeping.o: in function `timekeeping_init':
+timekeeping.c:(.init.text+0xd2): undefined reference to `ntp_init'
+
+But this time, let's try to do something for these broken references. After a 
+change, a new compilation is performed to check which references remain.
+The principle of this solution is to provide a group of definintions in-place
+for the function bodies that have been removed with ntp.o altogether.
+Of course these function bodies are enclosed around the classic conditional 
+compilation structure with a test over the label.
+The construct is added at the top of the file, because of C language matters.
+kernel/time/timekeeping.c: undefined reference to `ntp_clear': 
+	ntp_clear() call can be directly defined as an empty function, since the
+	clearing operations are not needed.
+kernel/time/timekeeping.c: undefined reference to `ntp_get_next_leap':
+	The function ntp_get_next_leap() will simply return KTIME_MAX, condition
+	for no leapsecond pending.
+kernel/time/timekeeping.c: undefined reference to `second_overflow':
+	This is function will just return 0, which is the condition where leap 
+	detection tells that no leap is present (the amount of seconds to add or
+	remove which have been accumulated due to errors)
+kernel/time/timekeeping.c: undefined reference to `ntp_tick_length':
+	In this case it is quite difficult to understand what the default value
+	should be... A safe value to be returned can be the value stored by 
+	default into the variable "ntpinterval". This value is equal to 
+	NTP_INTERVAL_LENGTH << clock->shift. So, under the hypothesys that no 
+	shift in needed, it can return the NTP_INTERVAL_LENGTH value.
+kernel/time/timekeeping.c: undefined reference to `__do_adjtimex':
+	For the moment, just return that everything is ok with TIME_OK.
+kernel/time/timekeeping.c: undefined reference to `ntp_init':
+	An empty function (because calls ntp_clear, already empty, and since no
+	cmos clock is on board, the called function ntp_init_cmos_sync already 
+	exists in the empty variant).
+Now the linking can proceed without errors. The resulting kernel is the 
+following:
+	New kernel size
+	   text	   data	    bss	    dec	    hex	filename
+	 818620	  84513	  42164	 945297	  e6c91	build/stm32f401re/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 2/23 grow/shrink: 1/13 up/down: 564/-2718 (-2154)
+	[... many lines...]
+	Total: Before=830844, After=828690, chg -0.26%
+That's not a big change, but still appreciated... 
+
+
+[KERNEL TINYFICATION: UN-INLINING FUNCTIONS]
+But a closer look in the kernel/time/timekeeping.c file reveals that a lot of 
+functions are inlining their code... This means that the same code will be 
+replicated whenever a call to it is performed. What happens if those functions 
+are un-inlined? Let's find out...
+Also in this situation, the un-inlining is made conditional over a test over a 
+macro. In order to support this functionality, a new label is introduced in the
+init/Kconfig, under the option:
+        menuconfig INLINE_INFRASTRUCTURE
+                bool "Enable function inlining"
+                default y
+                help
+		  Avoid the inlining of function code to reduce the overall code
+		  size.
+        if INLINE_INFRASTRUCTURE
+
+        config TIMEKEEP_INLINE
+                bool "Keep inlining the functions inside kernel/time/timekeep.c"
+                default y
+                help
+        ...
+        endif # INLINE_INFRASTRUCTURE
+Then, for every occurrence of the functions having "inline" give two headers,
+one which is the original inlined, and one having "noinline" instead. Only one
+between these two is selected using the label. The same thing has to be done 
+over the functions prototypes in the respective headers.
+kernel/time/timekeeping_internal.h:
+	...
+	#ifdef CONFIG_TIMEKEEP_INLINE
+	static inline u64 clocksource_delta(u64 now, u64 last, u64 mask)
+	#else
+	static noinline u64 clocksource_delta(u64 now, u64 last, u64 mask)
+	#endif
+	{...}
+kernel/time/ntp_internal.h:
+	Few functions are present and single line statements. Not modified.
+kernel/time/tick-internal.h:
+	A large amount of function is present (31). Well, the inline can be left
+	on the empty or return-only-statement functions. So this file is 
+	untouched.
+kernel/time/timekeeping.c:
+	Here large inlined-code is present. Wrap every non-empty-body function's 
+	header around the test over the label.
+	There are functions with "__always_inline", so those are ignored 
+	(performance crucial for it).
+First, compile without the new symbol to test that everything is still defined 
+as it should be. Then, compile without the inlines. The result is the following:
+	New kernel size
+	   text	   data	    bss	    dec	    hex	filename
+	 817844	  84521	  42132	 944497	  e6971	build/stm32f401re/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 7/0 grow/shrink: 18/16 up/down: 508/-1340 (-832)
+	Total: Before=828690, After=827858, chg -0.10%
+The reduction is not so important also in this case, but shows the potential to 
+be applied on large scale over the whole kernel components. Of course, this 
+concept must be applied with consciousness...
+
+
+[KERNEL TINYFICATION: RCU]
+What can be done now to further shrink the kernel size?
+About the rcu subsystem, the kernel provides some features to reduce the size of
+the internal kernel data structures and code related to it, but the support for
+this is not available anymore for the preemptive kernel (since 3.11 because of 
+marginal gains in space and thus it has been preferred to drop the 
+TINY_PREEMPT_RCU support). This means that only TINY_RCU, TREE_RCU and 
+TREE_PREEMPT_RCU remains.
+So... What can be done practically speaking? Well, if it is possible, sacrifice
+the kernel's preemptivity. If the system can still ensure the soft real-time
+property, the non-realtime kernel can be adopted (more ont KERNEL TINYFICATION:
+PREEMPT-RT).
+Now, since the preemptivity have been abandoned, TINY_RCU is already applied.
+
+
+[KERNEL TINYFICATION: PREEMPT-RT]
+The initial kernel has been desired to be preemptible in order to support soft
+real-time performance... But is it really needed? Well, the specific application
+of this kernel is not defined, the author desired it to be soft real-time 
+because he likes embedded systems and devices...
+If the standard non-realtime kernel still satisfy the timing requirements, 
+there's no need for forcing the preemption. Moreover... The premptive property
+has a cost... More memory usage (ROM & RAM).
+Let's now evaluate the PREEMPT_RT cost using the reference kernel (preemptive) 
+as the model to compare against a new kernel (non-preeemptive). The result is:
+	New kernel size
+	   text	   data	    bss	    dec	    hex	filename
+	 892984	  85629	  42260	1020873	  f93c9	build/stm32f401re/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 92/437 grow/shrink: 180/1117 up/down: 3236/-80417 (-77181)
+	[... +1000 lines of functions...]
+	Total: Before=973988, After=896807, chg -7.92%
+Well, that's quite of a change! The .text, .data and .bss sections have all 
+shrinked. So, since the main aim is to first fit the target and then ensure the
+performance, the preemptivity property can be dropped (not the author's 
+light-hearted decision...)
+
+Reference: https://lwn.net/Articles/541037/
+
+[KERNEL TINYFICATION: MODULES]
+But how about modules? Some modules have been built in the kernel in order to 
+support some feature and not rely on some user-space utility. In the file 
+"modules.builtin", a list of kernel inbuilt modules is stored. By reading its
+lines, what catches the attention is the psmouse module... Well... Why would an
+embedded system, which is intended to only support the serial communication,
+support the PS2 mouse? This module can be removed to further reduce the kernel
+size. 
+In order to do so, disable in the graphical menu:
+	Device Drivers
+		Input device support
+			Generic input layer
+				Mice
+A new compilation reveals the gains:
+	New kernel size
+	   text	   data	    bss	    dec	    hex	filename
+	 853632	  84733	  42244	 980609	  ef681	build/stm32f401re/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 0/275 grow/shrink: 0/4 up/down: 0/-34156 (-34156)
+	[... +250 lines...]
+	Total: Before=896807, After=862651, chg -3.81%
+Another good result.
+The same thing can be applied to the keyboard, since the kernel will only 
+communicate bidirectionally on the serial line (well, not supporting the video
+output makes impossible to get a feedback over the sent characters... every I/O
+will be on the host machine through emulated tty). The option is located near 
+the mice ones.
+	New kernel size
+	   text	   data	    bss	    dec	    hex	filename
+	 845572	  84597	  42236	 972405	  ed675	build/stm32f401re/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 0/46 grow/shrink: 0/5 up/down: 0/-7343 (-7343)
+	[... +50 lines...]
+	Total: Before=862651, After=855308, chg -0.85%
+That's a marginal improvement, but still welcomed.
+Again, as a consequence of the previous selections, the libps2 module can now be
+removed because no device will use a PS/2 port. This option is near the previous
+two, but under the "Hardware I/O ports" section. The result is:
+New kernel size
+   text	   data	    bss	    dec	    hex	filename
+ 844108	  84589	  42236	 970933	  ed0b5	build/stm32f401re/vmlinux
+Bloat-o-meter gain calculation
+add/remove: 0/14 grow/shrink: 0/0 up/down: 0/-1314 (-1314)
+[... some lines...]
+Total: Before=855308, After=853994, chg -0.15%
+
+What else can be done? Well, regarding the modules, it would be nice to be able
+to drop the crc32 and zlib_inflate modules...
+About the crc32, the implementation can be chosen. This can help reduce the 
+memory footprint by reducing the look-up table dimension. In the graphical
+menu:
+	Library routines
+		CRC32/CRC32c functions
+			CRC32 implementation
+				Slice by 8 bytes
+				Slice by 4 bytes
+				Sarwate's Algorithm (one byte at a time)
+From top to bottom are the lesser expensive and performant.
+Slice by 8 B is the default. Now, the effect on the kernel are analyzed in the
+remaining cases:
+Slice by 4B:
+	New kernel size
+	   text	   data	    bss	    dec	    hex	filename
+	 831724	  84589	  42236	 958549	  ea055	build/stm32f401re/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 0/0 grow/shrink: 0/5 up/down: 0/-12376 (-12376)
+	Function                                     old     new   delta
+	crc32_le_base                                 10       8      -2
+	crc32_body                                   228     142     -86
+	crc32table_le                               8192    4096   -4096
+	crc32table_be                               8192    4096   -4096
+	crc32ctable_le                              8192    4096   -4096
+	Total: Before=853994, After=841618, chg -1.45%
+Slice by 1B:
+	New kernel size
+	   text	   data	    bss	    dec	    hex	filename
+	 822432	  84589	  42236	 949257	  e7c09	build/stm32f401re/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 0/1 grow/shrink: 3/3 up/down: 76/-21732 (-21656)
+	Function                                     old     new   delta
+	__crc32c_le_base                               8      40     +32
+	crc32_le_base                                 10      34     +24
+	crc32_be                                      20      40     +20
+	crc32_body                                   228       -    -228
+	crc32table_le                               8192    1024   -7168
+	crc32table_be                               8192    1024   -7168
+	crc32ctable_le                              8192    1024   -7168
+	Total: Before=853994, After=832338, chg -2.54%
+In this particular case, having a slower but smaller implementation can be 
+beneficial.
+
+For what concerns the zlib_inflate, the cramfs routines rely on it, even tho the
+minimal filesystem to be written in the same Flash as the kernel will not be 
+compressed (less ROM efficient, but more RAM efficient). A possible solution is
+a similar approach seen for the syscall: rely on tests over macros and avoid the
+call of the zlib routines in the cramfs functions' bodies, then rely on the 
+linker which won't link functions code without a caller. 
+That's not a thing that the author will do because of the complexity of the
+
+
+[KERNEL TINYFICATION: TINYCONFIG + CUSTOM REDUCTIONS]
+Now, analyzing the basic "tinyconfig" kernel size, reveals that it needs 
+595287 B. It is quite close to the target. What if the printk and serial 
+communication are dropped, but the flat binaries ad cramfs support are kept?
+A new compilation reveals that:
+	New kernel size:
+	   text	   data	    bss	    dec	    hex	filename
+	 645300	  47373	  22332	 715005	  ae8fd	build/test/vmlinux
+	Bloat-o-meter gain calculation
+	add/remove: 461/1 grow/shrink: 20/2 up/down: 48305/-156 (48149)
+	[...]
+	Total: Before=595287, After=643436, chg +8.09%
+Just these simple modifications require a lot of code and variables...
+But at least the RAM constraint is met!
+Let's now try to apply all the patches explored until now and see the result
+compared againt the tinyconfig:
+New kernel size:
+   text	   data	    bss	    dec	    hex	filename
+ 619164	  47289	  22236	 688689	  a8231	build/test/vmlinux
+Bloat-o-meter gain calculation
+add/remove: 469/37 grow/shrink: 45/36 up/down: 49295/-27266 (22029)
+[...]
+Total: Before=595287, After=617316, chg +3.70%
+This step is performed just to have a feedback regarding the direction of this
+experimental port. This means that the direction of this project is the right 
+one in the sense of the common idea behind the already known concept of 
+"bloat-hunt" in the Linux kernel community. But still a lot of work has to be 
+done in order to fit the kernel in a so small SoC. If the target were one of the
+already supported MCUs, well of course it would have fit (that's why already 
+supported by the kernel). The already supported MCUs are still interesting 
+because of the provided performance to cost parameter: 
+STM32H743ZI:
+	core: M7
+	price: ~18€
+	performance: 1027 DMIPS/ 2.14 DMIPS/MHz (Dhrystone 2.1)
+	power consumption: 160 mA @ 400Mhz, Tj = 25°C, peripherals off
+			(~ 400 μA/MHz) (worst case: 750 mA @ higher Tj)
+STM32F401RE:
+	core: M4
+	price ~8€ 
+	performance: 105 DMIPS/1.25 DMIPS/MHz (Dhrystone 2.1))
+	power consumption: 146 μA/MHz (peripheral off)
+But why is it still interesting? If the MCU itself can provide enough 
+performance for the target application, a lower hardware design cost is 
+achieved. (compared to a MPU system, no additional FLASH and RAM chips and 
+relative controllers, compact PCB area to host the system, less EMC design
+cost because of less PCB copper lines, ...).
+
+
+CUSTOMIZED BOOTLOADER
+The chosen bootloader has been forked from mcoquelin's afboot fork. This 
+customized fork is done in order to introduce the support for the NUCLEO-F401RE
+board, since the mcoquelin's one on GitHub only supports the boards based on
+STM32F429, STM32F469, STM32F746, STM32F769 and STM32H743 microcontrollers.
+The new files are obtained by copying the existing ones and modifying the parts
+which differs in terms of architecture performance and hardware resources.
+The bootloader is designed to start at every reset event (whether HW or SW 
+resets), so it is located in the lowest section of the Flash memory.
+
+Note: once the bootloader is compiled, its size can be used to determine at 
+which address the kernel should be placed, in order to optimally use the Flash
+address space. The bootloader's size is the offset from the Flash starting 
+address. So, in the kernel configuration (see KCONFIG section), at the "XIP 
+Kernel Physical Location", set the address as: 
+	FLASH_STARTING_ADDRESS + BOOTLOADER_SIZE + DTB_ADDRESS
+
+Now, the compilation reveals the final bootloader size:
+	arm-none-eabi-size stm32f401re-nucleo.elf
+	   text	   data	    bss	    dec	    hex	filename
+	   1106	      0	      0	   1106	    452	stm32f401re-nucleo.elf
+So, in order to set the right kernel start position, the Device Tree Blob (flat
+device tree) dimension is needed. The DTB is embedded into linux thanks to the 
+file arch/arm/mach-stm32/board-dt.c: it contains the DTBs for the supported 
+boards. Since in step [KCONFIG] no board is selected, it defaults to "NULL" and 
+then a compiled dtb is produced. It is not code, but read-only data. By using
+the "size" command on board-dt.o, the required dimension is obtained:
+	text	   data	    bss	    dec	    hex	filename
+	 235	      0	      0	    235	     eb	arch/arm/mach-stm32/board-dt.o
+But in reality, this is not something to be worried about because this piece of
+information is already embedded into the kernel and linked in the 
+arch/arm/mach-stm32/Makefile. So, only the bootloader size is needed to find the
+kernel starting address. So the final starting kernel address is:
+	0x08000000 + 0x0452 = 0x08000452
+So, the kernel configuration can now be adapted accordingly.
+
+
+APPLICATIONS
+Compiled with customized linker script.	
